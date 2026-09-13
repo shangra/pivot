@@ -430,29 +430,152 @@ class Extensions {
     }
 
     /**
-     * Старые хуки: hook(result). Новые: hook(result, params, original).
-     * Один объект hookParams оставляем вторым аргументом — его читает
-     * getClassesMetadata(innerResult, functionParams).
+     * Экземпляр модуля из триггера, не MetadataService.
      * @private
      */
-    static async invokeHook(hook, result, functionParams, originalMethod, info) {
+    static getTriggerInstance(trigger) {
+        if (!trigger) {
+            return null;
+        }
+        return (
+            trigger.instance ||
+            trigger.this ||
+            trigger.context ||
+            trigger.service ||
+            trigger.info?.instance ||
+            trigger.info?.this ||
+            trigger.info?.service ||
+            trigger.info?.object ||
+            null
+        );
+    }
+
+    /**
+     * В бандле __dirname у модуля пустой. Ищем исходный *.service.js на диске.
+     * @private
+     */
+    static resolveServicePath(info) {
+        const rel = info?.class || info?.path || info?.file;
+        if (!rel || typeof rel !== 'string') {
+            return null;
+        }
+
+        const fs = require('fs');
+        const path = require('path');
+        const cwd = process.cwd();
+        const normalized = rel.replace(/^[\\/]/, '');
+        const candidates = [
+            rel,
+            path.join(cwd, rel),
+            path.join(cwd, normalized),
+            path.join(cwd, 'ext_modules', normalized),
+        ];
+
+        try {
+            const extRoot = path.join(cwd, 'ext_modules');
+            if (fs.existsSync(extRoot)) {
+                for (const mod of fs.readdirSync(extRoot)) {
+                    candidates.push(path.join(extRoot, mod, normalized));
+                }
+            }
+        } catch (e) {
+            // нет ext_modules рядом с процессом
+        }
+
+        for (const candidate of candidates) {
+            try {
+                if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+                    return candidate;
+                }
+            } catch (e) {
+                // путь недоступен
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @private
+     */
+    static loadHookReceiver(trigger, info) {
+        const path = require('path');
+        const instance = Extensions.getTriggerInstance(trigger);
+        const servicePath = Extensions.resolveServicePath(info);
+        const functionName = info?.function;
+
+        if (instance) {
+            if (servicePath) {
+                instance.dirname = path.dirname(servicePath);
+            }
+            return { instance, functionName, servicePath };
+        }
+
+        if (!servicePath) {
+            return { instance: null, functionName, servicePath };
+        }
+
+        try {
+            const Service = require(servicePath);
+            const fresh = typeof Service === 'function' ? new Service() : Service;
+            if (fresh) {
+                fresh.dirname = path.dirname(servicePath);
+            }
+            return { instance: fresh, functionName, servicePath };
+        } catch (e) {
+            Extensions.log('loadHookReceiver failed', {
+                servicePath,
+                message: e.message,
+            });
+            return { instance: null, functionName, servicePath };
+        }
+    }
+
+    /**
+     * Старые хуки: hook(result). Новые: hook(result, params, original).
+     * getClassesMetadata должен бежать на экземпляре модуля (Roles/Rules),
+     * а не на MetadataService — иначе this.id = нули и this.dirname пустой.
+     * @private
+     */
+    static async invokeHook(
+        hook,
+        result,
+        functionParams,
+        originalMethod,
+        info,
+        trigger
+    ) {
         if (typeof hook !== 'function') {
             return result;
         }
 
-        const hookThis = functionParams?.this;
+        const receiver = Extensions.loadHookReceiver(trigger, info);
+        const hookThis = receiver.instance;
+        const methodName = receiver.functionName;
+        const method =
+            hookThis && methodName && typeof hookThis[methodName] === 'function'
+                ? hookThis[methodName]
+                : hook;
+
         Extensions.log('invokeHook in', {
             hook: hook.name || 'anonymous',
             hookLength: hook.length,
             resultIn: Extensions.dump(result),
-            thisId: hookThis?.id,
-            thisDirname: hookThis?.dirname,
-            thisConstructor: hookThis?.constructor?.name,
-            args0: functionParams?.[0],
-            argsLength: functionParams?.length,
+            info,
+            triggerKeys: trigger ? Object.keys(trigger) : [],
+            receiverId: hookThis?.id,
+            receiverDirname: hookThis?.dirname,
+            receiverConstructor: hookThis?.constructor?.name,
+            servicePath: receiver.servicePath,
+            viaInstance: Boolean(hookThis && method !== hook),
         });
 
-        const next = await hook(result, functionParams, originalMethod);
+        const next =
+            hookThis && method !== hook
+                ? await method.call(hookThis, result, functionParams, originalMethod)
+                : hookThis
+                  ? await hook.call(hookThis, result, functionParams, originalMethod)
+                  : await hook(result, functionParams, originalMethod);
+
         Extensions.log('invokeHook out', {
             hook: hook.name || 'anonymous',
             returnedUndefined: next === undefined,
@@ -504,7 +627,8 @@ class Extensions {
                     result,
                     functionParams,
                     originalMethod,
-                    info
+                    info,
+                    trigger
                 );
                 trace = true;
             } catch (e) {
