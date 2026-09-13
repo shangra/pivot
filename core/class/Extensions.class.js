@@ -127,32 +127,6 @@ class Extensions {
     }
 
     /**
-     * Старый контракт: исходные позиционные args.
-     * Новая перегрузка: значения из extArgs, если имена параметров надёжно сняты.
-     * @private
-     */
-    static getSourceArgs(funcParamNames, extArgs, args) {
-        const names = (funcParamNames || []).filter(
-            (name) =>
-                typeof name === 'string' &&
-                name &&
-                name !== 'this' &&
-                /^[A-Za-z_$][\w$]*$/.test(name)
-        );
-
-        // В бандле toString() часто без аргументов — Object.values(extArgs) даёт []
-        if (!names.length || names.length < args.length) {
-            return args;
-        }
-
-        return names.map((name, i) =>
-            Object.prototype.hasOwnProperty.call(extArgs, name)
-                ? extArgs[name]
-                : args[i]
-        );
-    }
-
-    /**
      * @private
      * @param {string} functionName
      * @param {object} functionState
@@ -358,39 +332,33 @@ class Extensions {
                         enumerable: false,
                     });
 
-                    let { result, trace } = await Extensions.before(
+                    let { result } = await Extensions.before(
                         method,
                         undefined,
                         extArgs,
                         this
                     );
 
-                    ({ result, trace } = await Extensions.inner(
+                    ({ result } = await Extensions.inner(
                         method,
                         result,
                         extArgs,
                         this
                     ));
 
-                    if (!trace) {
-                        ({ result, trace } = await Extensions.decorate(
-                            method,
-                            result,
-                            extArgs,
-                            this,
-                            source.bind(this)
-                        ));
+                    // decorate может заменить метод; before/inner исходный вызов не отменяют
+                    const decorated = await Extensions.decorate(
+                        method,
+                        result,
+                        extArgs,
+                        this,
+                        source.bind(this)
+                    );
 
-                        if (!trace) {
-                            result = await source.apply(
-                                this,
-                                Extensions.getSourceArgs(
-                                    funcParamNames,
-                                    extArgs,
-                                    args
-                                )
-                            );
-                        }
+                    if (decorated.trace) {
+                        result = decorated.result;
+                    } else {
+                        result = await source.apply(this, args);
                     }
 
                     ({ result } = await Extensions.after(
