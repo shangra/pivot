@@ -26,6 +26,78 @@ class Extensions {
     }
 
     /**
+     * Имена класса, которые ещё видны после сборки.
+     * constructor.name в бандле часто становится "t"/"n", а в toString
+     * ещё может остаться исходное `class MetadataService`.
+     * @private
+     */
+    static getConstructorNames(constructor, prototype) {
+        const names = [];
+        if (constructor?.name) {
+            names.push(constructor.name);
+        }
+        if (prototype?._hookClassName) {
+            names.push(prototype._hookClassName);
+        }
+        try {
+            const source = constructor?.toString?.() || '';
+            const classMatch = source.match(/\bclass\s+([A-Za-z_$][\w$]*)/);
+            if (classMatch) {
+                names.push(classMatch[1]);
+            }
+            const fnMatch = source.match(/\bfunction\s+([A-Za-z_$][\w$]*)/);
+            if (fnMatch && fnMatch[1] !== 'async') {
+                names.push(fnMatch[1]);
+            }
+        } catch (e) {
+            // toString недоступен — оставляем constructor.name
+        }
+        return [...new Set(names.filter(Boolean))];
+    }
+
+    /**
+     * Ключи sreda.hooks для метода: сначала точное имя класса,
+     * затем запасной поиск по суффиксу Method.state (если имя сжали).
+     * @private
+     */
+    static resolveHookKeys(context, functionName, functionState) {
+        const hooks = sreda.hooks || {};
+        const names = Extensions.getConstructorNames(
+            context?.constructor,
+            Object.getPrototypeOf(context)
+        );
+        if (context?.childrenClassName) {
+            names.unshift(context.childrenClassName);
+        }
+
+        const keys = [];
+        const seen = new Set();
+        for (const name of names) {
+            const key = `${name}.${functionName}.${functionState}`;
+            if (!seen.has(key) && hooks[key]) {
+                seen.add(key);
+                keys.push(key);
+            }
+        }
+
+        if (!keys.length) {
+            const suffix = `.${functionName}.${functionState}`;
+            for (const key of Object.keys(hooks)) {
+                if (!key.endsWith(suffix) || seen.has(key)) {
+                    continue;
+                }
+                const classPart = key.slice(0, key.length - suffix.length);
+                if (classPart && !classPart.includes('.')) {
+                    seen.add(key);
+                    keys.push(key);
+                }
+            }
+        }
+
+        return keys;
+    }
+
+    /**
      * Различает исходный Extensions и новые перегрузки.
      *
      * legacy — модули под старый класс: after-хук получает только результат
@@ -103,6 +175,9 @@ class Extensions {
     }
 
     /**
+     * После бандла hook.length и toString часто врут (Babel переписывает
+     * сигнатуру в arguments). Лишние аргументы старые хуки игнорируют,
+     * поэтому в бандле всегда передаём полный набор.
      * @private
      */
     static async invokeHook(
@@ -118,8 +193,9 @@ class Extensions {
         }
 
         const kind = Extensions.getHookKind(hook, functionState, info);
+        const bundled = Extensions.getFuncParamNames(hook).length === 0;
         const next =
-            kind === 'extended'
+            kind === 'extended' || bundled
                 ? await hook(result, functionParams, originalMethod)
                 : await hook(result);
 
@@ -143,11 +219,21 @@ class Extensions {
         context,
         originalMethod
     ) {
+        Extensions.wrapKnownPrototypes();
+
         let trace = false;
         let result = await functionResult;
-        const extFunctionName = `${context.childrenClassName}.${functionName}.${functionState}`;
-        if (sreda.hooks[extFunctionName]) {
+        const hookKeys = Extensions.resolveHookKeys(
+            context,
+            functionName,
+            functionState
+        );
+
+        for (const extFunctionName of hookKeys) {
             const triggers = sreda.hooks[extFunctionName];
+            if (!triggers) {
+                continue;
+            }
             for (const trigger of triggers) {
                 const { info, hook } = trigger;
                 // триггер выполняется один раз, и удаляется из памяти
@@ -287,91 +373,178 @@ class Extensions {
     }
 
     /**
+     * Собирает extArgs и по именам, и по позиции: после Babel сигнатура
+     * метода часто пустая, а аргументы лежат в arguments / rest.
+     * @private
+     */
+    static buildExtArgs(source, args, instance) {
+        const funcParamNames = Extensions.getFuncParamNames(source);
+        const extArgs = Object.fromEntries(
+            funcParamNames.map((name, i) => [name, args[i]])
+        );
+
+        args.forEach((value, i) => {
+            if (extArgs[i] === undefined) {
+                extArgs[i] = value;
+            }
+        });
+
+        extArgs.this = instance;
+        Object.defineProperty(extArgs, '$args', {
+            value: args,
+            enumerable: false,
+        });
+        return extArgs;
+    }
+
+    /**
+     * @private
+     */
+    static createWrapper(prototype, method) {
+        return async function (...args) {
+            Extensions.wrapKnownPrototypes();
+
+            const source = prototype._sourceMethods[method];
+            const extArgs = Extensions.buildExtArgs(source, args, this);
+
+            let { result } = await Extensions.before(
+                method,
+                undefined,
+                extArgs,
+                this
+            );
+
+            ({ result } = await Extensions.inner(
+                method,
+                result,
+                extArgs,
+                this
+            ));
+
+            // decorate может заменить метод; before/inner исходный вызов не отменяют
+            const decorated = await Extensions.decorate(
+                method,
+                result,
+                extArgs,
+                this,
+                source.bind(this)
+            );
+
+            if (decorated.trace) {
+                result = decorated.result;
+            } else {
+                result = await source.apply(this, args);
+            }
+
+            ({ result } = await Extensions.after(
+                method,
+                result,
+                extArgs,
+                this
+            ));
+
+            return result;
+        };
+    }
+
+    /**
+     * Обёртка идемпотентна: в бандле хуки часто появляются позже первого
+     * `new MetadataService()`, поэтому прототип дооборачивается позже.
+     * @private
+     */
+    static wrapPrototype(prototype) {
+        if (!prototype || prototype === Object.prototype) {
+            return;
+        }
+
+        const targets = Object.keys(sreda.hooks || {});
+        if (!targets.length) {
+            return;
+        }
+
+        const classNames = Extensions.getConstructorNames(
+            prototype.constructor,
+            prototype
+        );
+        if (!prototype._sourceMethods) {
+            prototype._sourceMethods = {};
+        }
+
+        const methods = Object.getOwnPropertyNames(prototype).filter(
+            (method) =>
+                method !== 'constructor' &&
+                typeof prototype[method] === 'function'
+        );
+
+        for (const method of methods) {
+            if (prototype._sourceMethods[method]) {
+                continue;
+            }
+
+            const hookClass = classNames.find((name) =>
+                targets.some(
+                    (target) =>
+                        target.replace(
+                            /\.(inner|before|after|decorate)$/,
+                            ''
+                        ) === `${name}.${method}`
+                )
+            );
+            if (!hookClass) {
+                continue;
+            }
+
+            if (!prototype._hookClassName) {
+                prototype._hookClassName = hookClass;
+            }
+            prototype._sourceMethods[method] = prototype[method];
+            prototype[method] = Extensions.createWrapper(prototype, method);
+        }
+    }
+
+    /**
+     * @private
+     */
+    static wrapKnownPrototypes() {
+        const known = Extensions._knownPrototypes;
+        if (!known) {
+            return;
+        }
+        for (const prototype of known) {
+            Extensions.wrapPrototype(prototype);
+        }
+    }
+
+    /**
+     * @private
+     */
+    static scheduleWrap(prototype) {
+        if (!Extensions._knownPrototypes) {
+            Extensions._knownPrototypes = new Set();
+        }
+        Extensions._knownPrototypes.add(prototype);
+        Extensions.wrapPrototype(prototype);
+
+        if (prototype._wrapScheduled) {
+            return;
+        }
+        prototype._wrapScheduled = true;
+
+        const retry = () => Extensions.wrapPrototype(prototype);
+        if (typeof process !== 'undefined' && process.nextTick) {
+            process.nextTick(retry);
+        }
+        if (typeof setImmediate === 'function') {
+            setImmediate(retry);
+        }
+        setTimeout(retry, 0);
+    }
+
+    /**
      * @private
      */
     extendService() {
-        const prototype = Object.getPrototypeOf(this);
-        const targets = Object.keys(sreda.hooks || {});
-
-        // методы в прототипе перегружаются только 1 раз и после сборки
-        if (!prototype._sourceMethods && targets.length) {
-            /** @type {Record<string, Function>} */
-            prototype._sourceMethods = {};
-
-            const className = this.constructor.name;
-            const methods = Object.getOwnPropertyNames(prototype).filter(
-                (method) =>
-                    method !== 'constructor' &&
-                    typeof prototype[method] === 'function' &&
-                    targets.find(
-                        (target) =>
-                            target.replace(
-                                /\.(inner|before|after|decorate)$/,
-                                ''
-                            ) === `${className}.${method}`
-                    )
-            );
-            for (const method of methods) {
-                // записываем исходные методы в скрытое поле прототипа
-                prototype._sourceMethods[method] = prototype[method];
-
-                // возвращаем новую функцию (this внутри всегда будет у того объекта, на котором вызван метод)
-
-                // т.к. новая функция по определению может быть только в классах, унаследованных от Extensions,
-                // у объекта (this) гарантированно будут методы класса Extensions
-                prototype[method] = async function (...args) {
-                    const source = prototype._sourceMethods[method];
-                    const funcParamNames = Extensions.getFuncParamNames(source);
-                    const extArgs = Object.fromEntries(
-                        funcParamNames.map((name, i) => [name, args[i]])
-                    );
-
-                    extArgs.this = this;
-                    Object.defineProperty(extArgs, '$args', {
-                        value: args,
-                        enumerable: false,
-                    });
-
-                    let { result } = await Extensions.before(
-                        method,
-                        undefined,
-                        extArgs,
-                        this
-                    );
-
-                    ({ result } = await Extensions.inner(
-                        method,
-                        result,
-                        extArgs,
-                        this
-                    ));
-
-                    // decorate может заменить метод; before/inner исходный вызов не отменяют
-                    const decorated = await Extensions.decorate(
-                        method,
-                        result,
-                        extArgs,
-                        this,
-                        source.bind(this)
-                    );
-
-                    if (decorated.trace) {
-                        result = decorated.result;
-                    } else {
-                        result = await source.apply(this, args);
-                    }
-
-                    ({ result } = await Extensions.after(
-                        method,
-                        result,
-                        extArgs,
-                        this
-                    ));
-
-                    return result;
-                };
-            }
-        }
+        Extensions.scheduleWrap(Object.getPrototypeOf(this));
     }
 }
 
