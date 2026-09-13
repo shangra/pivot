@@ -1,4 +1,18 @@
 class Extensions {
+    static DEBUG = false;
+
+    static log(...args) {
+        if (Extensions.DEBUG) {
+            console.log(...args);
+        }
+    }
+
+    static error(...args) {
+        if (Extensions.DEBUG) {
+            console.error(...args);
+        }
+    }
+
     /**
      * @constructor
      */
@@ -26,9 +40,26 @@ class Extensions {
     }
 
     /**
-     * Имена класса, которые ещё видны после сборки.
-     * constructor.name в бандле часто становится "t"/"n", а в toString
-     * ещё может остаться исходное `class MetadataService`.
+     * Реестр хуков: либо Map с ключом-функцией, либо объект
+     * `Class.method.after` — как в package.json.
+     * @private
+     */
+    static getHookStore() {
+        const hooks =
+            (typeof sreda !== 'undefined' && sreda.hooks) ||
+            (typeof global !== 'undefined' && global.sreda?.hooks) ||
+            null;
+        if (!hooks) {
+            return { hooks: null, keys: [] };
+        }
+        const keys =
+            typeof hooks.keys === 'function'
+                ? Array.from(hooks.keys())
+                : Object.keys(hooks);
+        return { hooks, keys };
+    }
+
+    /**
      * @private
      */
     static getConstructorNames(constructor, prototype) {
@@ -50,113 +81,102 @@ class Extensions {
                 names.push(fnMatch[1]);
             }
         } catch (e) {
-            // toString недоступен — оставляем constructor.name
+            // toString недоступен
         }
         return [...new Set(names.filter(Boolean))];
     }
 
     /**
-     * Ключи sreda.hooks для метода: сначала точное имя класса,
-     * затем запасной поиск по суффиксу Method.state (если имя сжали).
+     * Хуки есть, если ключ — сама функция (бандл) или строка Class.method.state.
      * @private
      */
-    static resolveHookKeys(context, functionName, functionState) {
-        const hooks = sreda.hooks || {};
-        const names = Extensions.getConstructorNames(
+    static methodHasHooks(originalMethod, methodName, classNames, hookKeys, hooks) {
+        if (hookKeys.includes(originalMethod)) {
+            return true;
+        }
+        const states = ['before', 'inner', 'after', 'decorate'];
+        return classNames.some((name) =>
+            states.some((state) => {
+                const key = `${name}.${methodName}.${state}`;
+                return hookKeys.includes(key) || Boolean(hooks?.[key]);
+            })
+        );
+    }
+
+    /**
+     * @private
+     */
+    static collectTriggers(entry, functionState) {
+        if (!entry) {
+            return [];
+        }
+        if (Array.isArray(entry)) {
+            return entry.filter((trigger) => {
+                const type = trigger?.info?.hookType || trigger?.info?.state;
+                return !type || type === functionState;
+            });
+        }
+        if (entry[functionState]) {
+            return entry[functionState];
+        }
+        return [];
+    }
+
+    /**
+     * @private
+     */
+    static getTriggers(sourceMethod, methodName, functionState, context) {
+        const { hooks } = Extensions.getHookStore();
+        if (!hooks) {
+            return [];
+        }
+
+        const seen = new Set();
+        const triggers = [];
+        const push = (entry) => {
+            for (const trigger of Extensions.collectTriggers(entry, functionState)) {
+                if (trigger && !seen.has(trigger)) {
+                    seen.add(trigger);
+                    triggers.push(trigger);
+                }
+            }
+        };
+
+        if (sourceMethod && typeof hooks.get === 'function') {
+            push(hooks.get(sourceMethod));
+        }
+        if (sourceMethod && hooks[sourceMethod]) {
+            push(hooks[sourceMethod]);
+        }
+
+        const classNames = Extensions.getConstructorNames(
             context?.constructor,
             Object.getPrototypeOf(context)
         );
         if (context?.childrenClassName) {
-            names.unshift(context.childrenClassName);
+            classNames.unshift(context.childrenClassName);
+        }
+        for (const name of classNames) {
+            push(hooks[`${name}.${methodName}.${functionState}`]);
         }
 
-        const keys = [];
-        const seen = new Set();
-        for (const name of names) {
-            const key = `${name}.${functionName}.${functionState}`;
-            if (!seen.has(key) && hooks[key]) {
-                seen.add(key);
-                keys.push(key);
-            }
-        }
-
-        if (!keys.length) {
-            const suffix = `.${functionName}.${functionState}`;
-            for (const key of Object.keys(hooks)) {
-                if (!key.endsWith(suffix) || seen.has(key)) {
-                    continue;
-                }
-                const classPart = key.slice(0, key.length - suffix.length);
-                if (classPart && !classPart.includes('.')) {
-                    seen.add(key);
-                    keys.push(key);
-                }
-            }
-        }
-
-        return keys;
+        return triggers;
     }
 
     /**
-     * Различает исходный Extensions и новые перегрузки.
-     *
-     * legacy — модули под старый класс: after-хук получает только результат
-     *          исходного метода, например getTreeChildrenV2(children).
-     * extended — новые хуки: (innerResult, functionParams[, originalMethod]),
-     *            стадии before / inner / decorate.
-     *
-     * Явный флаг: trigger.info.contract = 'legacy' | 'extended'
      * @private
-     * @param {Function} hook
-     * @param {string} [functionState]
-     * @param {object} [info]
-     * @returns {'legacy'|'extended'}
      */
-    static getHookKind(hook, functionState, info) {
-        const forced = info?.contract || info?.kind;
-        if (forced === 'legacy' || forced === 'extended') {
-            return forced;
+    static findMethodName(context, sourceMethod) {
+        const prototype = Object.getPrototypeOf(context);
+        const map = prototype?._sourceMethods;
+        if (map && typeof map.entries === 'function') {
+            for (const [name, data] of map.entries()) {
+                if (data === sourceMethod || data?.fn === sourceMethod) {
+                    return name;
+                }
+            }
         }
-        if (info?.legacy === true) {
-            return 'legacy';
-        }
-        if (info?.extended === true) {
-            return 'extended';
-        }
-
-        if (
-            functionState === 'before' ||
-            functionState === 'inner' ||
-            functionState === 'decorate'
-        ) {
-            return 'extended';
-        }
-
-        if (typeof hook !== 'function') {
-            return 'legacy';
-        }
-
-        const names = Extensions.getFuncParamNames(hook);
-        const arity = hook.length;
-        const source = Extensions.getFunctionSource(hook);
-        const extendedMarks = [
-            'functionParams',
-            'originalMethod',
-            'innerResult',
-            'extArgs',
-        ];
-
-        if (extendedMarks.some((mark) => names.includes(mark))) {
-            return 'extended';
-        }
-        if (extendedMarks.some((mark) => source.includes(mark))) {
-            return 'extended';
-        }
-        if (arity >= 2) {
-            return 'extended';
-        }
-
-        return 'legacy';
+        return typeof sourceMethod === 'string' ? sourceMethod : sourceMethod?.name || '';
     }
 
     /**
@@ -175,44 +195,88 @@ class Extensions {
     }
 
     /**
-     * После бандла hook.length и toString часто врут (Babel переписывает
-     * сигнатуру в arguments). Лишние аргументы старые хуки игнорируют,
-     * поэтому в бандле всегда передаём полный набор.
      * @private
      */
-    static async invokeHook(
-        hook,
-        result,
-        functionParams,
-        originalMethod,
-        functionState,
-        info
-    ) {
+    static getFuncParamNames(func) {
+        if (typeof func !== 'function') {
+            return [];
+        }
+
+        const STRIP_COMMENTS = /((\/\/.*$)|(\/\*[\s\S]*?\*\/))/gm;
+        const ARGUMENT_NAMES = /(?:\.{3})?([A-Za-z_$][\w$]*)/;
+
+        try {
+            const fnStr = func.toString().replace(STRIP_COMMENTS, '');
+            if (fnStr.includes('[native code]')) {
+                return [];
+            }
+            const fnArgs = fnStr.slice(fnStr.indexOf('(') + 1, fnStr.indexOf(')'));
+            if (!fnArgs.trim()) {
+                return [];
+            }
+            return fnArgs.split(',').map((arg) => {
+                const trimmed = arg.trim();
+                const matched = trimmed.match(ARGUMENT_NAMES);
+                return matched ? matched[1] : trimmed;
+            }).filter(Boolean);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    /**
+     * Как у другой команды: имена, если ещё есть, плюс позиция.
+     * id / options — запасные имена после Babel.
+     * @private
+     */
+    static buildFunctionParams(paramNames, args, instance) {
+        const functionParams = { this: instance };
+
+        (paramNames || []).forEach((name, i) => {
+            if (i < args.length) {
+                functionParams[name] = args[i];
+            }
+        });
+        args.forEach((arg, i) => {
+            functionParams[i] = arg;
+        });
+        if (args.length > 0) {
+            functionParams.id = args[0];
+            functionParams.metadata_id = args[0];
+        }
+        if (args.length > 1) {
+            functionParams.options = args[1];
+        }
+        functionParams.args = args;
+        functionParams.length = args.length;
+
+        Object.defineProperty(functionParams, '$args', {
+            value: args,
+            enumerable: false,
+        });
+        return functionParams;
+    }
+
+    /**
+     * Старые хуки: hook(result). Новые: hook(result, params, original).
+     * Один объект hookParams оставляем вторым аргументом — его читает
+     * getClassesMetadata(innerResult, functionParams).
+     * @private
+     */
+    static async invokeHook(hook, result, functionParams, originalMethod, info) {
         if (typeof hook !== 'function') {
             return result;
         }
 
-        const kind = Extensions.getHookKind(hook, functionState, info);
-        const bundled = Extensions.getFuncParamNames(hook).length === 0;
-        const next =
-            kind === 'extended' || bundled
-                ? await hook(result, functionParams, originalMethod)
-                : await hook(result);
-
+        const next = await hook(result, functionParams, originalMethod);
         return next === undefined ? result : next;
     }
 
     /**
      * @private
-     * @param {string} functionName
-     * @param {object} functionState
-     * @param {object} functionResult
-     * @param {object} functionParams
-     * @param {object} context
-     * @param {Function} [originalMethod]
      */
     static async hook(
-        functionName,
+        sourceMethod,
         functionState,
         functionResult,
         functionParams,
@@ -223,42 +287,46 @@ class Extensions {
 
         let trace = false;
         let result = await functionResult;
-        const hookKeys = Extensions.resolveHookKeys(
-            context,
-            functionName,
-            functionState
+        const methodName = Extensions.findMethodName(context, sourceMethod);
+        const triggers = Extensions.getTriggers(
+            sourceMethod,
+            methodName,
+            functionState,
+            context
         );
 
-        for (const extFunctionName of hookKeys) {
-            const triggers = sreda.hooks[extFunctionName];
-            if (!triggers) {
-                continue;
-            }
-            for (const trigger of triggers) {
-                const { info, hook } = trigger;
-                // триггер выполняется один раз, и удаляется из памяти
-                if (info.once) {
-                    sreda.hooks[extFunctionName] = sreda.hooks[
-                        extFunctionName
-                    ].filter((globalTrigger) => globalTrigger !== trigger);
-                }
-                try {
-                    result = await Extensions.invokeHook(
-                        hook,
-                        result,
-                        functionParams,
-                        originalMethod,
-                        functionState,
-                        info
-                    );
-                    trace = true;
-                } catch (e) {
-                    if (info.once) {
-                        // если произошла ошибка при выполнении триггера, возвращаем его в память, так как он не выполнился
-                        sreda.hooks[extFunctionName].push(trigger);
+        for (const trigger of triggers) {
+            const { info, hook } = trigger;
+            if (info?.once) {
+                const { hooks } = Extensions.getHookStore();
+                if (hooks && typeof hooks.get === 'function') {
+                    const current = hooks.get(sourceMethod) || [];
+                    if (Array.isArray(current)) {
+                        hooks.set(
+                            sourceMethod,
+                            current.filter((item) => item !== trigger)
+                        );
                     }
-                    throw e;
                 }
+            }
+            try {
+                Extensions.log(
+                    ` -> hook: ${hook?.name || 'anonymous'} (${functionState}) from ${context?.constructor?.name}`
+                );
+                result = await Extensions.invokeHook(
+                    hook,
+                    result,
+                    functionParams,
+                    originalMethod,
+                    info
+                );
+                trace = true;
+            } catch (e) {
+                Extensions.error(
+                    ` !! ERROR in ${hook?.name || 'anonymous'} (${functionState}):`,
+                    e.message
+                );
+                throw e;
             }
         }
 
@@ -267,15 +335,10 @@ class Extensions {
 
     /**
      * @private
-     * @param {string} functionName
-     * @param {any} functionResult
-     * @param {object} functionParams
-     * @param {object} context
-     * @returns {Promise<{ trace: boolean, result: any }>}
      */
-    static async before(functionName, functionResult, functionParams, context) {
+    static async before(sourceMethod, functionResult, functionParams, context) {
         return this.hook(
-            functionName,
+            sourceMethod,
             context.STATE.before,
             functionResult,
             functionParams,
@@ -285,15 +348,10 @@ class Extensions {
 
     /**
      * @private
-     * @param {string} functionName
-     * @param {object} functionResult
-     * @param {object} functionParams
-     * @param {object} context
-     * @returns {Promise<{ trace: boolean, result: any }>}
      */
-    static async inner(functionName, functionResult, functionParams, context) {
+    static async inner(sourceMethod, functionResult, functionParams, context) {
         return this.hook(
-            functionName,
+            sourceMethod,
             context.STATE.inner,
             functionResult,
             functionParams,
@@ -303,15 +361,10 @@ class Extensions {
 
     /**
      * @private
-     * @param {string} functionName
-     * @param {object} functionResult
-     * @param {object} functionParams
-     * @param {object} context
-     * @returns {Promise<{ trace: boolean, result: any }>}
      */
-    static async after(functionName, functionResult, functionParams, context) {
+    static async after(sourceMethod, functionResult, functionParams, context) {
         return this.hook(
-            functionName,
+            sourceMethod,
             context.STATE.after,
             functionResult,
             functionParams,
@@ -321,21 +374,16 @@ class Extensions {
 
     /**
      * @private
-     * @param {string} functionName
-     * @param {object} functionResult
-     * @param {object} functionParams
-     * @param {object} context
-     * @returns {Promise<{ trace: boolean, result: any }>}
      */
     static async decorate(
-        functionName,
+        sourceMethod,
         functionResult,
         functionParams,
         context,
         originalMethod
     ) {
         return this.hook(
-            functionName,
+            sourceMethod,
             context.STATE.decorate,
             functionResult,
             functionParams,
@@ -347,99 +395,53 @@ class Extensions {
     /**
      * @private
      */
-    static getFuncParamNames(func) {
-        if (typeof func !== 'function') {
-            return [];
-        }
-
-        const STRIP_COMMENTS = /((\/\/.*$)|(\/\*[\s\S]*?\*\/))/gm;
-        const ARGUMENT_NAMES = /(?:\.{3})?([A-Za-z_$][\w$]*)/;
-        const fnStr = func.toString().replace(STRIP_COMMENTS, '');
-
-        if (fnStr.includes('[native code]')) {
-            return [];
-        }
-
-        const fnArgs = fnStr.slice(fnStr.indexOf('(') + 1, fnStr.indexOf(')'));
-        return fnArgs
-            ? fnArgs
-                  .split(',')
-                  .map((arg) => {
-                      const matched = arg.trim().match(ARGUMENT_NAMES);
-                      return matched ? matched[1] : null;
-                  })
-                  .filter(Boolean)
-            : [];
-    }
-
-    /**
-     * Собирает extArgs и по именам, и по позиции: после Babel сигнатура
-     * метода часто пустая, а аргументы лежат в arguments / rest.
-     * @private
-     */
-    static buildExtArgs(source, args, instance) {
-        const funcParamNames = Extensions.getFuncParamNames(source);
-        const extArgs = Object.fromEntries(
-            funcParamNames.map((name, i) => [name, args[i]])
-        );
-
-        args.forEach((value, i) => {
-            if (extArgs[i] === undefined) {
-                extArgs[i] = value;
-            }
-        });
-
-        extArgs.this = instance;
-        Object.defineProperty(extArgs, '$args', {
-            value: args,
-            enumerable: false,
-        });
-        return extArgs;
-    }
-
-    /**
-     * @private
-     */
-    static createWrapper(prototype, method) {
+    static createWrapper(prototype, methodName) {
         return async function (...args) {
             Extensions.wrapKnownPrototypes();
 
-            const source = prototype._sourceMethods[method];
-            const extArgs = Extensions.buildExtArgs(source, args, this);
-
-            let { result } = await Extensions.before(
-                method,
-                undefined,
-                extArgs,
+            const sourceData = prototype._sourceMethods.get(methodName);
+            const sourceMethod = sourceData.fn;
+            const functionParams = Extensions.buildFunctionParams(
+                sourceData.paramNames,
+                args,
                 this
             );
 
+            Extensions.log(
+                `\n=== CALL: ${this.constructor.name}.${methodName} ===`
+            );
+
+            let { result } = await Extensions.before(
+                sourceMethod,
+                undefined,
+                functionParams,
+                this
+            );
             ({ result } = await Extensions.inner(
-                method,
+                sourceMethod,
                 result,
-                extArgs,
+                functionParams,
                 this
             ));
 
-            // decorate может заменить метод; before/inner исходный вызов не отменяют
             const decorated = await Extensions.decorate(
-                method,
+                sourceMethod,
                 result,
-                extArgs,
+                functionParams,
                 this,
-                source.bind(this)
+                sourceMethod.bind(this)
             );
 
             if (decorated.trace) {
                 result = decorated.result;
             } else {
-                result = await source.apply(this, args);
+                result = await sourceMethod.apply(this, args);
             }
 
             ({ result } = await Extensions.after(
-                method,
+                sourceMethod,
                 result,
-                extArgs,
+                functionParams,
                 this
             ));
 
@@ -448,8 +450,6 @@ class Extensions {
     }
 
     /**
-     * Обёртка идемпотентна: в бандле хуки часто появляются позже первого
-     * `new MetadataService()`, поэтому прототип дооборачивается позже.
      * @private
      */
     static wrapPrototype(prototype) {
@@ -457,8 +457,8 @@ class Extensions {
             return;
         }
 
-        const targets = Object.keys(sreda.hooks || {});
-        if (!targets.length) {
+        const { hooks, keys: hookKeys } = Extensions.getHookStore();
+        if (!hooks || !hookKeys.length) {
             return;
         }
 
@@ -467,7 +467,7 @@ class Extensions {
             prototype
         );
         if (!prototype._sourceMethods) {
-            prototype._sourceMethods = {};
+            prototype._sourceMethods = new Map();
         }
 
         const methods = Object.getOwnPropertyNames(prototype).filter(
@@ -476,29 +476,45 @@ class Extensions {
                 typeof prototype[method] === 'function'
         );
 
-        for (const method of methods) {
-            if (prototype._sourceMethods[method]) {
+        for (const methodName of methods) {
+            if (prototype._sourceMethods.has(methodName)) {
                 continue;
             }
 
-            const hookClass = classNames.find((name) =>
-                targets.some(
-                    (target) =>
-                        target.replace(
-                            /\.(inner|before|after|decorate)$/,
-                            ''
-                        ) === `${name}.${method}`
+            const originalMethod = prototype[methodName];
+            if (
+                !Extensions.methodHasHooks(
+                    originalMethod,
+                    methodName,
+                    classNames,
+                    hookKeys,
+                    hooks
                 )
-            );
-            if (!hookClass) {
+            ) {
                 continue;
             }
 
             if (!prototype._hookClassName) {
-                prototype._hookClassName = hookClass;
+                const matched = classNames.find((name) =>
+                    hookKeys.some((key) =>
+                        typeof key === 'string' &&
+                        key.replace(/\.(inner|before|after|decorate)$/, '') ===
+                            `${name}.${methodName}`
+                    )
+                );
+                if (matched) {
+                    prototype._hookClassName = matched;
+                }
             }
-            prototype._sourceMethods[method] = prototype[method];
-            prototype[method] = Extensions.createWrapper(prototype, method);
+
+            prototype._sourceMethods.set(methodName, {
+                fn: originalMethod,
+                paramNames: Extensions.getFuncParamNames(originalMethod),
+            });
+            prototype[methodName] = Extensions.createWrapper(
+                prototype,
+                methodName
+            );
         }
     }
 
