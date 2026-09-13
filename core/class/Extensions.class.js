@@ -451,31 +451,57 @@ class Extensions {
     }
 
     /**
-     * В бандле __dirname у модуля пустой. Ищем исходный *.service.js на диске.
+     * В бандле __dirname у модуля пустой. Ищем исходный *.service.js на диске
+     * по строке из package.json или по имени конструктора (RolesService).
      * @private
      */
     static resolveServicePath(info) {
-        const rel = info?.class || info?.path || info?.file;
-        if (!rel || typeof rel !== 'string') {
-            return null;
-        }
-
+        const rel = info?.path || info?.file;
+        const classRef = info?.class;
         const fs = require('fs');
         const path = require('path');
         const cwd = process.cwd();
-        const normalized = rel.replace(/^[\\/]/, '');
-        const candidates = [
-            rel,
-            path.join(cwd, rel),
-            path.join(cwd, normalized),
-            path.join(cwd, 'ext_modules', normalized),
-        ];
+        const names = [];
+
+        if (typeof rel === 'string') {
+            names.push(path.basename(rel), rel.replace(/^[\\/]/, ''));
+        }
+        if (typeof classRef === 'string') {
+            names.push(path.basename(classRef), classRef.replace(/^[\\/]/, ''));
+        }
+        if (typeof classRef === 'function' && classRef.name) {
+            const name = classRef.name;
+            names.push(
+                `${name}.js`,
+                `${name.replace(/Service$/, '')}.service.js`,
+                `${name.replace(/Class$/, '')}.class.js`
+            );
+        }
+
+        const uniqueNames = [...new Set(names.filter(Boolean))];
+        if (!uniqueNames.length) {
+            return null;
+        }
+
+        const candidates = [];
+        for (const fileName of uniqueNames) {
+            candidates.push(
+                path.join(cwd, fileName),
+                path.join(cwd, 'ext_modules', fileName)
+            );
+        }
 
         try {
             const extRoot = path.join(cwd, 'ext_modules');
             if (fs.existsSync(extRoot)) {
                 for (const mod of fs.readdirSync(extRoot)) {
-                    candidates.push(path.join(extRoot, mod, normalized));
+                    const servicesDir = path.join(extRoot, mod, 'services');
+                    for (const fileName of uniqueNames) {
+                        candidates.push(
+                            path.join(extRoot, mod, fileName),
+                            path.join(servicesDir, path.basename(fileName))
+                        );
+                    }
                 }
             }
         } catch (e) {
@@ -499,35 +525,39 @@ class Extensions {
      */
     static loadHookReceiver(trigger, info) {
         const path = require('path');
-        const instance = Extensions.getTriggerInstance(trigger);
-        const servicePath = Extensions.resolveServicePath(info);
         const functionName = info?.function;
+        let instance = Extensions.getTriggerInstance(trigger);
+        const Service = typeof info?.class === 'function' ? info.class : null;
+        const servicePath = Extensions.resolveServicePath(info);
 
-        if (instance) {
-            if (servicePath) {
-                instance.dirname = path.dirname(servicePath);
+        if (!instance && Service) {
+            try {
+                instance = new Service();
+            } catch (e) {
+                Extensions.log('new info.class failed', {
+                    className: Service.name,
+                    message: e.message,
+                });
             }
-            return { instance, functionName, servicePath };
         }
 
-        if (!servicePath) {
-            return { instance: null, functionName, servicePath };
-        }
-
-        try {
-            const Service = require(servicePath);
-            const fresh = typeof Service === 'function' ? new Service() : Service;
-            if (fresh) {
-                fresh.dirname = path.dirname(servicePath);
+        if (!instance && servicePath) {
+            try {
+                const Loaded = require(servicePath);
+                instance = typeof Loaded === 'function' ? new Loaded() : Loaded;
+            } catch (e) {
+                Extensions.log('loadHookReceiver failed', {
+                    servicePath,
+                    message: e.message,
+                });
             }
-            return { instance: fresh, functionName, servicePath };
-        } catch (e) {
-            Extensions.log('loadHookReceiver failed', {
-                servicePath,
-                message: e.message,
-            });
-            return { instance: null, functionName, servicePath };
         }
+
+        if (instance && servicePath) {
+            instance.dirname = path.dirname(servicePath);
+        }
+
+        return { instance, functionName, servicePath };
     }
 
     /**
@@ -912,6 +942,52 @@ class Extensions {
                 paramNames,
             });
         }
+
+        Extensions.patchGetClassInstance(prototype);
+    }
+
+    /**
+     * getClassInstance делает require(путь). В бандле путь с диска
+     * иногда не открывается webpack-require — берём обычный Node require
+     * или сам конструктор, если хук уже положил функцию.
+     * @private
+     */
+    static patchGetClassInstance(prototype) {
+        if (
+            typeof prototype.getClassInstance !== 'function' ||
+            prototype._patchedGetClassInstance
+        ) {
+            return;
+        }
+        prototype._patchedGetClassInstance = true;
+        const original = prototype.getClassInstance;
+        prototype.getClassInstance = function (ext, classId, parent) {
+            const entry = ext?.[classId];
+            if (typeof entry === 'function') {
+                return new entry({ owner_id: parent });
+            }
+            if (typeof entry === 'string') {
+                const loaders = [require];
+                if (typeof __non_webpack_require__ === 'function') {
+                    loaders.unshift(__non_webpack_require__);
+                }
+                for (const load of loaders) {
+                    try {
+                        const loaded = load(entry);
+                        const ctor = loaded?.default || loaded;
+                        if (typeof ctor === 'function') {
+                            return new ctor({ owner_id: parent });
+                        }
+                    } catch (e) {
+                        // следующий loader
+                    }
+                }
+            }
+            return original.call(this, ext, classId, parent);
+        };
+        Extensions.log('patched getClassInstance', {
+            constructorName: prototype.constructor?.name,
+        });
     }
 
     /**
