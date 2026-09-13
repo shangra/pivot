@@ -1,0 +1,48 @@
+{
+  "name": "metadata-roles",
+  "version": "1.5.5",
+  "typeSR": "NodeCMS",
+  "enabled": true,
+  "description": "Модуль `metadata-roles` отвечает за управление ролями пользователей в системе",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": ""
+  },
+  "homepage": "",
+  "dependencies": {},
+  "dependenciesNodeCMS": {
+    "metadata-cmp": "~1.5.4",
+    "auth": "~1.5.0",
+    "metadata-forms": "~1.5.0"
+  },
+  "dependenciesReactCMS": {},
+  "extensions": {
+    "MetadataService.getClassesMetadata.after": {
+      "class": "/services/Roles.service.js",
+      "function": "getClassesMetadata"
+    },
+    "MetadataService.getTreeChildrenV2.after": {
+      "class": "/services/Roles.service.js",
+      "function": "getTreeChildrenV2"
+    },
+    "MetadataService.getTreeChildrenV3.after": {
+      "class": "/services/Roles.service.js",
+      "function": "getTreeChildrenV3"
+    }
+  },
+  "routes": {
+    "/metadata/roles": {
+      "router": "Roles.router.js"
+    }
+  }
+}
