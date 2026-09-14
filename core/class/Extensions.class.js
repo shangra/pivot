@@ -751,8 +751,8 @@ class Extensions {
             servicePath = Extensions.claimPackageServicePath(functionName);
         }
 
-        // Диск важнее обфусцированного конструктора: там живые __dirname и id.
-        if (servicePath) {
+        // Живой инстанс из реестра хуков важнее new() с диска (там нет DI).
+        if (!instance && servicePath) {
             try {
                 const Loaded = Extensions.nodeRequire(servicePath);
                 const ctor = Loaded?.default || Loaded;
@@ -784,17 +784,86 @@ class Extensions {
     }
 
     /**
-     * Экземпляр с диска нужен только хукам, которые читают this.dirname / this.id.
-     * Остальные (RLS before и т.п.) должны идти через уже bound hook —
-     * иначе new Service() без DI и падает на this.xxx.toLowerCase().
+     * После обфускации хук читает functionParams._0xabc, а мы кладём
+     * className / object. Для пропущенного ключа отдаём исходный аргумент.
      * @private
      */
-    static shouldBindDiskInstance(methodName) {
-        return (
-            methodName === 'getClassesMetadata' ||
-            methodName === 'getTreeChildrenV2' ||
-            methodName === 'getTreeChildrenV3'
-        );
+    static withParamFallback(functionParams) {
+        if (!functionParams || typeof functionParams !== 'object') {
+            return functionParams;
+        }
+        const args = functionParams.$args || functionParams.args || [];
+        const fallback = typeof args[0] === 'string' ? args[0] : undefined;
+        if (fallback === undefined) {
+            return functionParams;
+        }
+        return new Proxy(functionParams, {
+            get(target, prop, receiver) {
+                const value = Reflect.get(target, prop, receiver);
+                if (value !== undefined || typeof prop !== 'string') {
+                    return value;
+                }
+                if (
+                    prop === 'then' ||
+                    prop === 'toJSON' ||
+                    prop === 'constructor' ||
+                    prop === '$args'
+                ) {
+                    return value;
+                }
+                Extensions.log('functionParams fallback', { prop, fallback });
+                return fallback;
+            },
+        });
+    }
+
+    /**
+     * Тело хука с диска (не обфусцированное) + this из уже живого инстанса.
+     * @private
+     */
+    static resolveHookCall(hook, info, trigger) {
+        const methodName = info?.function;
+        const receiver = Extensions.loadHookReceiver(trigger, info);
+        let method = hook;
+        let hookThis = receiver.instance;
+        let viaDisk = false;
+
+        if (receiver.servicePath && methodName) {
+            try {
+                const Loaded = Extensions.nodeRequire(receiver.servicePath);
+                const ctor = Loaded?.default || Loaded;
+                const protoMethod =
+                    ctor && typeof ctor.prototype?.[methodName] === 'function'
+                        ? ctor.prototype[methodName]
+                        : null;
+                if (protoMethod) {
+                    method = protoMethod;
+                    viaDisk = true;
+                    if (!hookThis && typeof ctor === 'function') {
+                        hookThis = new ctor();
+                    }
+                } else if (
+                    hookThis &&
+                    typeof hookThis[methodName] === 'function'
+                ) {
+                    method = hookThis[methodName];
+                    viaDisk = true;
+                }
+            } catch (e) {
+                Extensions.log('resolveHookCall disk failed', {
+                    servicePath: receiver.servicePath,
+                    message: e.message,
+                });
+            }
+        }
+
+        return {
+            method,
+            hookThis,
+            viaDisk,
+            methodName,
+            servicePath: receiver.servicePath,
+        };
     }
 
     /**
@@ -809,50 +878,60 @@ class Extensions {
         functionParams,
         originalMethod,
         info,
-        trigger
+        trigger,
+        functionState
     ) {
         if (typeof hook !== 'function') {
             return result;
         }
 
-        const methodName = info?.function;
-        const useDisk = Extensions.shouldBindDiskInstance(methodName);
-        const receiver = useDisk
-            ? Extensions.loadHookReceiver(trigger, info)
-            : { instance: Extensions.getTriggerInstance(trigger), functionName: methodName, servicePath: null };
-        const hookThis = receiver.instance;
-        const method =
-            useDisk &&
-            hookThis &&
-            methodName &&
-            typeof hookThis[methodName] === 'function'
-                ? hookThis[methodName]
-                : hook;
-
+        const call = Extensions.resolveHookCall(hook, info, trigger);
         const args = functionParams?.$args || functionParams?.args || [];
-        // before: исходный метод ещё не вернул результат. Хуки вроде
-        // extendChildrenGetter ждут первым аргументом 'Metadata', не undefined.
         const first = result !== undefined ? result : args[0];
+        const params =
+            functionState === 'before'
+                ? Extensions.withParamFallback(functionParams)
+                : functionParams;
 
         Extensions.log('invokeHook in', {
             hook: hook.name || 'anonymous',
             hookLength: hook.length,
+            functionState,
             resultIn: Extensions.dump(first),
             info,
             triggerKeys: trigger ? Object.keys(trigger) : [],
-            receiverId: hookThis?.id,
-            receiverDirname: hookThis?.dirname,
-            receiverConstructor: hookThis?.constructor?.name,
-            servicePath: receiver.servicePath,
-            viaInstance: Boolean(useDisk && hookThis && method !== hook),
+            receiverId: call.hookThis?.id,
+            receiverDirname: call.hookThis?.dirname,
+            receiverConstructor: call.hookThis?.constructor?.name,
+            servicePath: call.servicePath,
+            viaDisk: call.viaDisk,
         });
 
-        const next =
-            hookThis && method !== hook
-                ? await method.call(hookThis, first, functionParams, originalMethod)
-                : hookThis
-                  ? await hook.call(hookThis, first, functionParams, originalMethod)
-                  : await hook(first, functionParams, originalMethod);
+        const run = async (fn, thisArg, callArgs) => {
+            if (thisArg) {
+                return fn.call(thisArg, ...callArgs);
+            }
+            return fn(...callArgs);
+        };
+
+        let next;
+        try {
+            next = await run(call.method, call.hookThis, [
+                first,
+                params,
+                originalMethod,
+            ]);
+        } catch (e) {
+            Extensions.log('invokeHook retry args', {
+                hook: hook.name || 'anonymous',
+                message: e.message,
+            });
+            try {
+                next = await run(call.method, call.hookThis, args);
+            } catch (e2) {
+                next = await run(hook, call.hookThis, args);
+            }
+        }
 
         Extensions.log('invokeHook out', {
             hook: hook.name || 'anonymous',
@@ -906,7 +985,8 @@ class Extensions {
                     functionParams,
                     originalMethod,
                     info,
-                    trigger
+                    trigger,
+                    functionState
                 );
                 trace = true;
             } catch (e) {
