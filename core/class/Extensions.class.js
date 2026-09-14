@@ -415,9 +415,18 @@ class Extensions {
         if (args.length > 0) {
             functionParams.id = args[0];
             functionParams.metadata_id = args[0];
+            functionParams.className = args[0];
+            functionParams.object = args[0];
+            functionParams.objectName = args[0];
+            functionParams.name = args[0];
+            functionParams.type = args[0];
+            functionParams.class = args[0];
         }
         if (args.length > 1) {
-            functionParams.options = args[1];
+            functionParams.options =
+                args.length > 2 && args[2] && typeof args[2] === 'object'
+                    ? args[2]
+                    : args[1];
         }
         functionParams.args = args;
         functionParams.length = args.length;
@@ -775,6 +784,20 @@ class Extensions {
     }
 
     /**
+     * Экземпляр с диска нужен только хукам, которые читают this.dirname / this.id.
+     * Остальные (RLS before и т.п.) должны идти через уже bound hook —
+     * иначе new Service() без DI и падает на this.xxx.toLowerCase().
+     * @private
+     */
+    static shouldBindDiskInstance(methodName) {
+        return (
+            methodName === 'getClassesMetadata' ||
+            methodName === 'getTreeChildrenV2' ||
+            methodName === 'getTreeChildrenV3'
+        );
+    }
+
+    /**
      * Старые хуки: hook(result). Новые: hook(result, params, original).
      * getClassesMetadata должен бежать на экземпляре модуля (Roles/Rules),
      * а не на MetadataService — иначе this.id = нули и this.dirname пустой.
@@ -792,33 +815,44 @@ class Extensions {
             return result;
         }
 
-        const receiver = Extensions.loadHookReceiver(trigger, info);
+        const methodName = info?.function;
+        const useDisk = Extensions.shouldBindDiskInstance(methodName);
+        const receiver = useDisk
+            ? Extensions.loadHookReceiver(trigger, info)
+            : { instance: Extensions.getTriggerInstance(trigger), functionName: methodName, servicePath: null };
         const hookThis = receiver.instance;
-        const methodName = receiver.functionName;
         const method =
-            hookThis && methodName && typeof hookThis[methodName] === 'function'
+            useDisk &&
+            hookThis &&
+            methodName &&
+            typeof hookThis[methodName] === 'function'
                 ? hookThis[methodName]
                 : hook;
+
+        const args = functionParams?.$args || functionParams?.args || [];
+        // before: исходный метод ещё не вернул результат. Хуки вроде
+        // extendChildrenGetter ждут первым аргументом 'Metadata', не undefined.
+        const first = result !== undefined ? result : args[0];
 
         Extensions.log('invokeHook in', {
             hook: hook.name || 'anonymous',
             hookLength: hook.length,
-            resultIn: Extensions.dump(result),
+            resultIn: Extensions.dump(first),
             info,
             triggerKeys: trigger ? Object.keys(trigger) : [],
             receiverId: hookThis?.id,
             receiverDirname: hookThis?.dirname,
             receiverConstructor: hookThis?.constructor?.name,
             servicePath: receiver.servicePath,
-            viaInstance: Boolean(hookThis && method !== hook),
+            viaInstance: Boolean(useDisk && hookThis && method !== hook),
         });
 
         const next =
             hookThis && method !== hook
-                ? await method.call(hookThis, result, functionParams, originalMethod)
+                ? await method.call(hookThis, first, functionParams, originalMethod)
                 : hookThis
-                  ? await hook.call(hookThis, result, functionParams, originalMethod)
-                  : await hook(result, functionParams, originalMethod);
+                  ? await hook.call(hookThis, first, functionParams, originalMethod)
+                  : await hook(first, functionParams, originalMethod);
 
         Extensions.log('invokeHook out', {
             hook: hook.name || 'anonymous',
