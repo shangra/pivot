@@ -142,6 +142,54 @@ class Extensions {
     }
 
     /**
+     * wrapper ищет `auth/services/Users.service` на диске.
+     * Без ext_modules берём конструктор из бандла.
+     */
+    static lookupEmbeddedService(servicePathArray, serviceName) {
+        const parts = (servicePathArray || []).filter(Boolean);
+        const moduleName = parts[0];
+        const rest = parts.slice(1).join('/');
+        const names = [serviceName];
+        if (serviceName && !String(serviceName).endsWith('.js')) {
+            names.push(`${serviceName}.js`);
+        }
+        const keys = [];
+        for (const name of names.filter(Boolean)) {
+            if (rest) {
+                keys.push(`/${rest}/${name}`, `${rest}/${name}`);
+            }
+            keys.push(`/${name}`, name);
+        }
+        const unique = [...new Set(keys.map((key) => key.replace(/\\/g, '/')))];
+        const mods = Extensions.getEmbeddedModules();
+        const matchMod = (mod) => {
+            const files = mod.files || {};
+            for (const key of unique) {
+                if (files[key]) {
+                    return Extensions.unwrapEmbeddedExport(files[key]);
+                }
+            }
+            return null;
+        };
+        const named = mods.find(
+            (mod) => mod.name === moduleName || mod.pkg?.name === moduleName
+        );
+        if (named) {
+            const found = matchMod(named);
+            if (found) {
+                return found;
+            }
+        }
+        for (const mod of mods) {
+            const found = matchMod(mod);
+            if (found) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Если CMS не прочитал ext_modules с диска — регистрируем хуки из бандла.
      * @private
      */

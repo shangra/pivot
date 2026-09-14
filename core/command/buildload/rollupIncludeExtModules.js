@@ -95,6 +95,34 @@ function collectModules(extRoot) {
             addFile(modDir, spec.router, acc, seen);
             addFile(modDir, `routers/${path.basename(spec.router)}`, acc, seen);
         }
+        const servicesDir = path.join(modDir, 'services');
+        if (fs.existsSync(servicesDir)) {
+            const walkServices = (dir) => {
+                for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                    if (
+                        entry.name.startsWith('.') ||
+                        entry.name === 'node_modules'
+                    ) {
+                        continue;
+                    }
+                    const full = path.join(dir, entry.name);
+                    if (entry.isDirectory()) {
+                        walkServices(full);
+                    } else if (
+                        entry.name.endsWith('.service.js') ||
+                        entry.name.endsWith('.class.js')
+                    ) {
+                        addFile(
+                            modDir,
+                            path.relative(modDir, full),
+                            acc,
+                            seen
+                        );
+                    }
+                }
+            };
+            walkServices(servicesDir);
+        }
         mods.push({ name, pkg, files: acc });
     }
     return mods;
