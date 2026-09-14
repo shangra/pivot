@@ -85,7 +85,202 @@ class Extensions {
      * `Class.method.after` — как в package.json.
      * @private
      */
+    static getEmbeddedModules() {
+        const list =
+            (typeof global !== 'undefined' && global.__EXT_MODULES__) ||
+            (typeof sreda !== 'undefined' && sreda.__EXT_MODULES__) ||
+            [];
+        return Array.isArray(list) ? list : [];
+    }
+
+    /**
+     * Конструктор из бандла по пути из package.json (`/services/Roles.service.js`).
+     * @private
+     */
+    static lookupEmbeddedFile(classRef) {
+        if (!classRef) {
+            return null;
+        }
+        const mods = Extensions.getEmbeddedModules();
+        if (typeof classRef === 'function') {
+            for (const mod of mods) {
+                for (const exported of Object.values(mod.files || {})) {
+                    const ctor = exported?.default || exported;
+                    if (ctor === classRef) {
+                        return ctor;
+                    }
+                }
+            }
+            return classRef;
+        }
+        if (typeof classRef !== 'string') {
+            return null;
+        }
+        const rel = classRef.replace(/^[\\/]/, '');
+        const keys = [classRef, `/${rel}`, rel];
+        for (const mod of mods) {
+            const files = mod.files || {};
+            for (const key of keys) {
+                if (files[key]) {
+                    return files[key].default || files[key];
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Если CMS не прочитал ext_modules с диска — регистрируем хуки из бандла.
+     * @private
+     */
+    static ensureEmbeddedHooks() {
+        if (Extensions._embeddedHooksReady) {
+            return;
+        }
+        const mods = Extensions.getEmbeddedModules();
+        if (!mods.length) {
+            Extensions._embeddedHooksReady = true;
+            return;
+        }
+        const hooks =
+            (typeof sreda !== 'undefined' && sreda.hooks) ||
+            (typeof global !== 'undefined' && global.sreda?.hooks);
+        if (!hooks) {
+            return;
+        }
+        const read = (key) =>
+            typeof hooks.get === 'function' ? hooks.get(key) : hooks[key];
+        const write = (key, value) => {
+            if (typeof hooks.set === 'function') {
+                hooks.set(key, value);
+            } else {
+                hooks[key] = value;
+            }
+        };
+        let added = 0;
+        for (const mod of mods) {
+            const extensions = mod.pkg?.extensions || {};
+            for (const [key, spec] of Object.entries(extensions)) {
+                if (!spec || typeof spec.class !== 'string' || !spec.function) {
+                    continue;
+                }
+                const current = read(key);
+                if (Array.isArray(current) && current.length) {
+                    continue;
+                }
+                const ctor = Extensions.lookupEmbeddedFile(spec.class);
+                if (typeof ctor !== 'function') {
+                    continue;
+                }
+                let instance;
+                try {
+                    instance = new ctor();
+                } catch (e) {
+                    Extensions.log('embedded new failed', {
+                        key,
+                        message: e.message,
+                    });
+                    continue;
+                }
+                const fn = instance[spec.function];
+                if (typeof fn !== 'function') {
+                    continue;
+                }
+                write(key, [
+                    {
+                        hook: fn.bind(instance),
+                        info: {
+                            class: ctor,
+                            function: spec.function,
+                            path: spec.class,
+                        },
+                        instance,
+                    },
+                ]);
+                added += 1;
+            }
+        }
+        Extensions._embeddedHooksReady = true;
+        Extensions.log('embedded hooks', {
+            modules: mods.length,
+            added,
+        });
+    }
+
+    /**
+     * Карта classId → конструктор *.class.js из бандла, без fs.readdir.
+     * @private
+     */
+    static async mergeEmbeddedClassesMetadata(result) {
+        const mods = Extensions.getEmbeddedModules();
+        if (!mods.length) {
+            return result;
+        }
+        let merged =
+            result && typeof result === 'object' && !Array.isArray(result)
+                ? result
+                : {};
+        for (const mod of mods) {
+            const files = mod.files || {};
+            const classCtors = Object.entries(files)
+                .filter(([filePath]) => /\.class\.js$/i.test(filePath))
+                .map(([, exported]) => exported?.default || exported)
+                .filter((ctor) => typeof ctor === 'function');
+            for (const [filePath, exported] of Object.entries(files)) {
+                if (!/\.service\.js$/i.test(filePath)) {
+                    continue;
+                }
+                const ctor = exported?.default || exported;
+                if (typeof ctor !== 'function') {
+                    continue;
+                }
+                let instance;
+                try {
+                    instance = new ctor();
+                } catch (e) {
+                    continue;
+                }
+                if (!instance?.id) {
+                    continue;
+                }
+                const classCtor =
+                    classCtors.find(
+                        (item) =>
+                            item.name &&
+                            ctor.name &&
+                            item.name.replace(/Class$/, '') ===
+                                ctor.name.replace(/Service$/, '')
+                    ) || classCtors[0];
+                if (typeof instance.getClassesMetadata === 'function') {
+                    try {
+                        const next = await instance.getClassesMetadata(
+                            merged,
+                            {}
+                        );
+                        if (next && typeof next === 'object') {
+                            merged = next;
+                        }
+                    } catch (e) {
+                        Extensions.log('embedded getClassesMetadata failed', {
+                            filePath,
+                            message: e.message,
+                        });
+                    }
+                }
+                if (
+                    classCtor &&
+                    (typeof merged[instance.id] !== 'function')
+                ) {
+                    merged[instance.id] = classCtor;
+                }
+            }
+        }
+        Extensions.log('embedded classes metadata', Extensions.dump(merged));
+        return merged;
+    }
+
     static getHookStore() {
+        Extensions.ensureEmbeddedHooks();
         const hooks =
             (typeof sreda !== 'undefined' && sreda.hooks) ||
             (typeof global !== 'undefined' && global.sreda?.hooks) ||
@@ -517,10 +712,32 @@ class Extensions {
         if (Extensions._extServicePaths) {
             return Extensions._extServicePaths;
         }
-        const fs = require('fs');
-        const path = require('path');
         const found = [];
         const seen = new Set();
+
+        for (const mod of Extensions.getEmbeddedModules()) {
+            const extensions = mod.pkg?.extensions || {};
+            for (const [key, info] of Object.entries(extensions)) {
+                if (!info || !info.function) {
+                    continue;
+                }
+                const ctor = Extensions.lookupEmbeddedFile(info.class);
+                const token = `${mod.name}|${info.class}|${info.function}`;
+                if (seen.has(token)) {
+                    continue;
+                }
+                seen.add(token);
+                found.push({
+                    key,
+                    functionName: info.function,
+                    servicePath: info.class,
+                    ctor,
+                });
+            }
+        }
+
+        const fs = require('fs');
+        const path = require('path');
 
         const considerDir = (modDir) => {
             const pkgPath = path.join(modDir, 'package.json');
@@ -627,12 +844,25 @@ class Extensions {
             }
             seen.add(entry.servicePath);
             try {
-                const Loaded = Extensions.nodeRequire(entry.servicePath);
-                const ctor = Loaded?.default || Loaded;
-                const instance =
-                    typeof ctor === 'function' ? new ctor() : ctor;
-                if (instance) {
-                    instance.dirname = path.dirname(entry.servicePath);
+                const ctor =
+                    entry.ctor ||
+                    Extensions.lookupEmbeddedFile(entry.servicePath);
+                let instance;
+                if (typeof ctor === 'function') {
+                    instance = new ctor();
+                } else if (entry.servicePath) {
+                    const Loaded = Extensions.nodeRequire(entry.servicePath);
+                    const loadedCtor = Loaded?.default || Loaded;
+                    instance =
+                        typeof loadedCtor === 'function'
+                            ? new loadedCtor()
+                            : loadedCtor;
+                    if (instance && typeof entry.servicePath === 'string') {
+                        instance.dirname = path.dirname(entry.servicePath);
+                    }
+                }
+                if (!instance) {
+                    continue;
                 }
                 const method = instance?.[methodName];
                 if (typeof method !== 'function') {
@@ -742,16 +972,27 @@ class Extensions {
      * @private
      */
     static loadHookReceiver(trigger, info) {
-        const path = require('path');
         const functionName = info?.function;
         let instance = Extensions.getTriggerInstance(trigger);
-        const Service = typeof info?.class === 'function' ? info.class : null;
+        const Service =
+            (typeof info?.class === 'function' ? info.class : null) ||
+            Extensions.lookupEmbeddedFile(info?.class);
         let servicePath = Extensions.resolveServicePath(info);
         if (!servicePath) {
             servicePath = Extensions.claimPackageServicePath(functionName);
         }
 
-        // Живой инстанс из реестра хуков важнее new() с диска (там нет DI).
+        if (!instance && typeof Service === 'function') {
+            try {
+                instance = new Service();
+            } catch (e) {
+                Extensions.log('new info.class failed', {
+                    className: Service.name,
+                    message: e.message,
+                });
+            }
+        }
+
         if (!instance && servicePath) {
             try {
                 const Loaded = Extensions.nodeRequire(servicePath);
@@ -765,19 +1006,8 @@ class Extensions {
             }
         }
 
-        if (!instance && Service) {
-            try {
-                instance = new Service();
-            } catch (e) {
-                Extensions.log('new info.class failed', {
-                    className: Service.name,
-                    message: e.message,
-                });
-            }
-        }
-
-        if (instance && servicePath) {
-            instance.dirname = path.dirname(servicePath);
+        if (instance && servicePath && servicePath.includes(require('path').sep)) {
+            instance.dirname = require('path').dirname(servicePath);
         }
 
         return { instance, functionName, servicePath };
@@ -828,7 +1058,22 @@ class Extensions {
         let hookThis = receiver.instance;
         let viaDisk = false;
 
-        if (receiver.servicePath && methodName) {
+        const ctor =
+            Extensions.lookupEmbeddedFile(info?.class) ||
+            (typeof info?.class === 'function' ? info.class : null);
+        if (ctor && methodName && typeof ctor.prototype?.[methodName] === 'function') {
+            method = ctor.prototype[methodName];
+            viaDisk = true;
+            if (!hookThis) {
+                try {
+                    hookThis = new ctor();
+                } catch (e) {
+                    Extensions.log('resolveHookCall new failed', {
+                        message: e.message,
+                    });
+                }
+            }
+        } else if (receiver.servicePath && methodName) {
             try {
                 const Loaded = Extensions.nodeRequire(receiver.servicePath);
                 const ctor = Loaded?.default || Loaded;
@@ -1013,6 +1258,9 @@ class Extensions {
                 functionParams,
                 originalMethod
             );
+            if (methodName === 'getClassesMetadata') {
+                result = await Extensions.mergeEmbeddedClassesMetadata(result);
+            }
         }
 
         return { trace, result };
