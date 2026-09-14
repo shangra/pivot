@@ -1546,6 +1546,35 @@ class Extensions {
         }
 
         Extensions.patchGetClassInstance(prototype);
+        Extensions.patchFunctionRequire();
+    }
+
+    /**
+     * getClassesMetadata в бандле отдаёт конструктор, а getMetadata
+     * делает require(id) и ждёт строку. require(функция) → этот патч
+     * возвращает сам конструктор.
+     * @private
+     */
+    static patchFunctionRequire() {
+        if (Extensions._patchedFunctionRequire) {
+            return;
+        }
+        Extensions._patchedFunctionRequire = true;
+        try {
+            const Module = require('module');
+            const original = Module.prototype.require;
+            Module.prototype.require = function patchedRequire(id) {
+                if (typeof id === 'function') {
+                    return id.default || id;
+                }
+                return original.apply(this, arguments);
+            };
+            Extensions.log('patched Module.require for constructor ids');
+        } catch (e) {
+            Extensions.log('patch Function require failed', {
+                message: e.message,
+            });
+        }
     }
 
     /**
