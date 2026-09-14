@@ -451,6 +451,211 @@ class Extensions {
     }
 
     /**
+     * Webpack-require не открывает произвольный путь с диска.
+     * @private
+     */
+    static nodeRequire(id) {
+        if (typeof __non_webpack_require__ === 'function') {
+            return __non_webpack_require__(id);
+        }
+        return require(id);
+    }
+
+    /**
+     * Каталоги, где лежат модули: cwd, папка бандла, ext_modules.
+     * @private
+     */
+    static getModuleRoots() {
+        const fs = require('fs');
+        const path = require('path');
+        const roots = new Set();
+        const add = (dir) => {
+            if (!dir) {
+                return;
+            }
+            try {
+                if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+                    roots.add(path.resolve(dir));
+                    const ext = path.join(dir, 'ext_modules');
+                    if (fs.existsSync(ext) && fs.statSync(ext).isDirectory()) {
+                        roots.add(path.resolve(ext));
+                    }
+                }
+            } catch (e) {
+                // каталог недоступен
+            }
+        };
+        add(process.cwd());
+        if (process.argv[1]) {
+            add(path.dirname(process.argv[1]));
+        }
+        try {
+            if (typeof require !== 'undefined' && require.main?.filename) {
+                add(path.dirname(require.main.filename));
+            }
+        } catch (e) {
+            // require.main нет в бандле
+        }
+        return [...roots];
+    }
+
+    /**
+     * Все `extensions.class` из package.json модулей.
+     * Путь на диске не зависит от обфусцированного constructor.name.
+     * @private
+     */
+    static collectExtensionServicePaths() {
+        if (Extensions._extServicePaths) {
+            return Extensions._extServicePaths;
+        }
+        const fs = require('fs');
+        const path = require('path');
+        const found = [];
+        const seen = new Set();
+
+        const considerDir = (modDir) => {
+            const pkgPath = path.join(modDir, 'package.json');
+            if (!fs.existsSync(pkgPath)) {
+                return;
+            }
+            let pkg;
+            try {
+                pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            } catch (e) {
+                return;
+            }
+            const extensions = pkg.extensions || {};
+            for (const [key, info] of Object.entries(extensions)) {
+                if (!info || typeof info.class !== 'string') {
+                    continue;
+                }
+                const rel = info.class.replace(/^[\\/]/, '');
+                const abs = path.join(modDir, rel);
+                const token = `${abs}|${info.function || ''}`;
+                if (!fs.existsSync(abs) || seen.has(token)) {
+                    continue;
+                }
+                seen.add(token);
+                found.push({
+                    key,
+                    functionName: info.function,
+                    servicePath: abs,
+                });
+            }
+        };
+
+        for (const root of Extensions.getModuleRoots()) {
+            considerDir(root);
+            try {
+                for (const name of fs.readdirSync(root)) {
+                    considerDir(path.join(root, name));
+                }
+            } catch (e) {
+                // не каталог модулей
+            }
+        }
+
+        Extensions._extServicePaths = found;
+        Extensions.log('package extension services', {
+            count: found.length,
+            items: found.map((item) => ({
+                key: item.key,
+                functionName: item.functionName,
+                path: item.servicePath,
+            })),
+        });
+        return found;
+    }
+
+    /**
+     * Следующий ещё не занятый *.service.js для этого метода хука.
+     * @private
+     */
+    static claimPackageServicePath(functionName) {
+        if (!functionName) {
+            return null;
+        }
+        if (!Extensions._claimedServicePaths) {
+            Extensions._claimedServicePaths = new Set();
+        }
+        for (const entry of Extensions.collectExtensionServicePaths()) {
+            if (entry.functionName !== functionName) {
+                continue;
+            }
+            if (Extensions._claimedServicePaths.has(entry.servicePath)) {
+                continue;
+            }
+            Extensions._claimedServicePaths.add(entry.servicePath);
+            return entry.servicePath;
+        }
+        return null;
+    }
+
+    /**
+     * После обфускации часть хуков не находит свой сервис по имени класса.
+     * Прогоняем те же методы с диска — карта классов собирается целиком.
+     * @private
+     */
+    static async applyPackageHooks(
+        methodName,
+        result,
+        functionParams,
+        originalMethod
+    ) {
+        const entries = Extensions.collectExtensionServicePaths().filter(
+            (entry) => entry.functionName === methodName
+        );
+        if (!entries.length) {
+            return result;
+        }
+
+        const path = require('path');
+        const seen = new Set();
+        let merged = result;
+        for (const entry of entries) {
+            if (seen.has(entry.servicePath)) {
+                continue;
+            }
+            seen.add(entry.servicePath);
+            try {
+                const Loaded = Extensions.nodeRequire(entry.servicePath);
+                const ctor = Loaded?.default || Loaded;
+                const instance =
+                    typeof ctor === 'function' ? new ctor() : ctor;
+                if (instance) {
+                    instance.dirname = path.dirname(entry.servicePath);
+                }
+                const method = instance?.[methodName];
+                if (typeof method !== 'function') {
+                    continue;
+                }
+                const next = await method.call(
+                    instance,
+                    merged,
+                    functionParams,
+                    originalMethod
+                );
+                if (next !== undefined) {
+                    merged = next;
+                }
+                Extensions.log('package hook', {
+                    methodName,
+                    servicePath: entry.servicePath,
+                    receiverId: instance?.id,
+                    resultOut: Extensions.dump(merged),
+                });
+            } catch (e) {
+                Extensions.log('package hook failed', {
+                    methodName,
+                    servicePath: entry.servicePath,
+                    message: e.message,
+                });
+            }
+        }
+        return merged;
+    }
+
+    /**
      * В бандле __dirname у модуля пустой. Ищем исходный *.service.js на диске
      * по строке из package.json или по имени конструктора (RolesService).
      * @private
@@ -511,6 +716,10 @@ class Extensions {
         for (const candidate of candidates) {
             try {
                 if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+                    if (!Extensions._claimedServicePaths) {
+                        Extensions._claimedServicePaths = new Set();
+                    }
+                    Extensions._claimedServicePaths.add(candidate);
                     return candidate;
                 }
             } catch (e) {
@@ -528,7 +737,24 @@ class Extensions {
         const functionName = info?.function;
         let instance = Extensions.getTriggerInstance(trigger);
         const Service = typeof info?.class === 'function' ? info.class : null;
-        const servicePath = Extensions.resolveServicePath(info);
+        let servicePath = Extensions.resolveServicePath(info);
+        if (!servicePath) {
+            servicePath = Extensions.claimPackageServicePath(functionName);
+        }
+
+        // Диск важнее обфусцированного конструктора: там живые __dirname и id.
+        if (servicePath) {
+            try {
+                const Loaded = Extensions.nodeRequire(servicePath);
+                const ctor = Loaded?.default || Loaded;
+                instance = typeof ctor === 'function' ? new ctor() : ctor;
+            } catch (e) {
+                Extensions.log('loadHookReceiver disk failed', {
+                    servicePath,
+                    message: e.message,
+                });
+            }
+        }
 
         if (!instance && Service) {
             try {
@@ -536,18 +762,6 @@ class Extensions {
             } catch (e) {
                 Extensions.log('new info.class failed', {
                     className: Service.name,
-                    message: e.message,
-                });
-            }
-        }
-
-        if (!instance && servicePath) {
-            try {
-                const Loaded = require(servicePath);
-                instance = typeof Loaded === 'function' ? new Loaded() : Loaded;
-            } catch (e) {
-                Extensions.log('loadHookReceiver failed', {
-                    servicePath,
                     message: e.message,
                 });
             }
@@ -671,6 +885,20 @@ class Extensions {
                 });
                 throw e;
             }
+        }
+
+        if (
+            functionState === 'after' &&
+            (methodName === 'getClassesMetadata' ||
+                methodName === 'getTreeChildrenV2' ||
+                methodName === 'getTreeChildrenV3')
+        ) {
+            result = await Extensions.applyPackageHooks(
+                methodName,
+                result,
+                functionParams,
+                originalMethod
+            );
         }
 
         return { trace, result };
