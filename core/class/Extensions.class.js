@@ -97,6 +97,18 @@ class Extensions {
      * Конструктор из бандла по пути из package.json (`/services/Roles.service.js`).
      * @private
      */
+    static unwrapEmbeddedExport(exported) {
+        if (exported && typeof exported.load === 'function') {
+            try {
+                exported = exported.load();
+            } catch (e) {
+                Extensions.log('embedded load failed', { message: e.message });
+                return null;
+            }
+        }
+        return exported?.default || exported || null;
+    }
+
     static lookupEmbeddedFile(classRef) {
         if (!classRef) {
             return null;
@@ -105,7 +117,7 @@ class Extensions {
         if (typeof classRef === 'function') {
             for (const mod of mods) {
                 for (const exported of Object.values(mod.files || {})) {
-                    const ctor = exported?.default || exported;
+                    const ctor = Extensions.unwrapEmbeddedExport(exported);
                     if (ctor === classRef) {
                         return ctor;
                     }
@@ -122,7 +134,7 @@ class Extensions {
             const files = mod.files || {};
             for (const key of keys) {
                 if (files[key]) {
-                    return files[key].default || files[key];
+                    return Extensions.unwrapEmbeddedExport(files[key]);
                 }
             }
         }
@@ -224,13 +236,13 @@ class Extensions {
             const files = mod.files || {};
             const classCtors = Object.entries(files)
                 .filter(([filePath]) => /\.class\.js$/i.test(filePath))
-                .map(([, exported]) => exported?.default || exported)
+                .map(([, exported]) => Extensions.unwrapEmbeddedExport(exported))
                 .filter((ctor) => typeof ctor === 'function');
             for (const [filePath, exported] of Object.entries(files)) {
                 if (!/\.service\.js$/i.test(filePath)) {
                     continue;
                 }
-                const ctor = exported?.default || exported;
+                const ctor = Extensions.unwrapEmbeddedExport(exported);
                 if (typeof ctor !== 'function') {
                     continue;
                 }

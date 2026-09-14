@@ -159,7 +159,7 @@ function rollupIncludeExtModules(options = {}) {
                     const filesLiteral = mod.files
                         .map((file) => {
                             const spec = toRequire(fromDir, file.abs);
-                            return `            ${JSON.stringify(file.key)}: (() => { try { return require(${JSON.stringify(spec)}); } catch (e) { console.warn('[include-ext-modules]', ${JSON.stringify(spec)}, e.message); return null; } })()`;
+                            return `            ${JSON.stringify(file.key)}: { load: () => { try { return require(${JSON.stringify(spec)}); } catch (e) { console.warn('[include-ext-modules]', ${JSON.stringify(spec)}, e.message); return null; } } }`;
                         })
                         .join(',\n');
                     return `        {
