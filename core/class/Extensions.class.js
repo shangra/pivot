@@ -113,18 +113,10 @@ class Extensions {
         if (!classRef) {
             return null;
         }
-        const mods = Extensions.getEmbeddedModules();
         if (typeof classRef === 'function') {
-            for (const mod of mods) {
-                for (const exported of Object.values(mod.files || {})) {
-                    const ctor = Extensions.unwrapEmbeddedExport(exported);
-                    if (ctor === classRef) {
-                        return ctor;
-                    }
-                }
-            }
             return classRef;
         }
+        const mods = Extensions.getEmbeddedModules();
         if (typeof classRef !== 'string') {
             return null;
         }
@@ -282,12 +274,46 @@ class Extensions {
                 : {};
         for (const mod of mods) {
             const files = mod.files || {};
+            const extensionFiles = Object.values(mod.pkg?.extensions || {})
+                .map((spec) => spec?.class)
+                .filter((rel) => typeof rel === 'string');
+            if (!extensionFiles.length) {
+                continue;
+            }
+            const wanted = new Set();
+            for (const rel of extensionFiles) {
+                const clean = rel.replace(/^[\\/]/, '').replace(/\\/g, '/');
+                wanted.add(`/${clean}`);
+                wanted.add(clean);
+                wanted.add(rel);
+            }
             const classCtors = Object.entries(files)
-                .filter(([filePath]) => /\.class\.js$/i.test(filePath))
+                .filter(([filePath]) => {
+                    const key = filePath.replace(/\\/g, '/');
+                    if (!/\.class\.js$/i.test(key)) {
+                        return false;
+                    }
+                    return extensionFiles.some((rel) => {
+                        const dir = rel
+                            .replace(/^[\\/]/, '')
+                            .replace(/\\/g, '/')
+                            .replace(/[^/]+$/, '');
+                        return dir && key.includes(`/${dir}`);
+                    });
+                })
                 .map(([, exported]) => Extensions.unwrapEmbeddedExport(exported))
                 .filter((ctor) => typeof ctor === 'function');
             for (const [filePath, exported] of Object.entries(files)) {
-                if (!/\.service\.js$/i.test(filePath)) {
+                const key = filePath.replace(/\\/g, '/');
+                if (
+                    !/\.service\.js$/i.test(key) ||
+                    ![...wanted].some(
+                        (item) =>
+                            key === item ||
+                            key.endsWith(item) ||
+                            item.endsWith(key.replace(/^\//, ''))
+                    )
+                ) {
                     continue;
                 }
                 const ctor = Extensions.unwrapEmbeddedExport(exported);
@@ -329,7 +355,7 @@ class Extensions {
                 }
                 if (
                     classCtor &&
-                    (typeof merged[instance.id] !== 'function')
+                    typeof merged[instance.id] !== 'function'
                 ) {
                     merged[instance.id] = classCtor;
                 }
