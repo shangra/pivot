@@ -1,8 +1,12 @@
 /**
- * Плагин Rollup: кладёт все ext_modules в бандл и пишет global.__EXT_MODULES__.
+ * Плагин Rollup: кладёт ext_modules в бандл и пишет global.__EXT_MODULES__.
  *
- * Без этого `commonjs({ ignoreDynamicRequires: true })` оставляет
- * require(переменный путь) на диск — без папки ext_modules дерево пустое.
+ * Не тащит все js подряд — только main, extensions.class, routes.router
+ * и соседние *.class.js. Иначе Rollup падает на кривых require вроде
+ * `../core/services/memory-save`.
+ *
+ * Непрорезолвленные относительные require помечаются external, чтобы
+ * сборка не останавливалась.
  *
  * В rollup.config.cjs:
  *
@@ -14,35 +18,47 @@
  *       commonjs({ ignoreDynamicRequires: true }),
  *       copy({ ... }),
  *   ]
- *
- * Extensions читает global.__EXT_MODULES__ (хуки и карта классов),
- * диск больше не нужен.
  */
 const fs = require('fs');
 const path = require('path');
 
-const FILE_RE = /(?:index|service|class|controller|router)\.js$/i;
-
-function walkFiles(dir, acc = []) {
-    if (!fs.existsSync(dir)) {
-        return acc;
+function addFile(modDir, rel, acc, seen) {
+    if (!rel || typeof rel !== 'string') {
+        return;
     }
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (
-            entry.name === 'node_modules' ||
-            entry.name === '_tests_' ||
-            entry.name.startsWith('.')
-        ) {
+    const clean = rel.replace(/^[\\/]/, '');
+    const abs = path.normalize(path.join(modDir, clean));
+    if (seen.has(abs) || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+        return;
+    }
+    seen.add(abs);
+    acc.push({
+        abs,
+        key: `/${clean.replace(/\\/g, '/')}`,
+    });
+}
+
+function collectClassSiblings(modDir, serviceRel, acc, seen) {
+    const serviceAbs = path.join(modDir, serviceRel.replace(/^[\\/]/, ''));
+    const dirs = [
+        path.join(path.dirname(serviceAbs), 'metadata'),
+        path.dirname(serviceAbs),
+    ];
+    for (const dir of dirs) {
+        if (!fs.existsSync(dir)) {
             continue;
         }
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-            walkFiles(full, acc);
-        } else if (FILE_RE.test(entry.name)) {
-            acc.push(full);
+        for (const name of fs.readdirSync(dir)) {
+            if (name.endsWith('.class.js')) {
+                addFile(
+                    modDir,
+                    path.relative(modDir, path.join(dir, name)),
+                    acc,
+                    seen
+                );
+            }
         }
     }
-    return acc;
 }
 
 function collectModules(extRoot) {
@@ -62,11 +78,24 @@ function collectModules(extRoot) {
         } catch (e) {
             continue;
         }
-        const files = walkFiles(modDir).map((abs) => ({
-            abs,
-            key: `/${path.relative(modDir, abs).replace(/\\/g, '/')}`,
-        }));
-        mods.push({ name, pkg, files });
+        const acc = [];
+        const seen = new Set();
+        addFile(modDir, pkg.main || 'index.js', acc, seen);
+        addFile(modDir, 'index.js', acc, seen);
+        for (const spec of Object.values(pkg.extensions || {})) {
+            if (spec && typeof spec.class === 'string') {
+                addFile(modDir, spec.class, acc, seen);
+                collectClassSiblings(modDir, spec.class, acc, seen);
+            }
+        }
+        for (const spec of Object.values(pkg.routes || {})) {
+            if (!spec || typeof spec.router !== 'string') {
+                continue;
+            }
+            addFile(modDir, spec.router, acc, seen);
+            addFile(modDir, `routers/${path.basename(spec.router)}`, acc, seen);
+        }
+        mods.push({ name, pkg, files: acc });
     }
     return mods;
 }
@@ -79,11 +108,42 @@ function toRequire(fromDir, absFile) {
     return rel;
 }
 
+function existsResolved(importer, source) {
+    const resolved = path.resolve(path.dirname(importer), source);
+    return [
+        resolved,
+        `${resolved}.js`,
+        `${resolved}.cjs`,
+        `${resolved}.json`,
+        path.join(resolved, 'index.js'),
+    ].some((candidate) => {
+        try {
+            return fs.existsSync(candidate);
+        } catch (e) {
+            return false;
+        }
+    });
+}
+
 function rollupIncludeExtModules(options = {}) {
     const extRoot = path.resolve(options.root || process.cwd(), 'ext_modules');
 
     return {
         name: 'include-ext-modules',
+        resolveId(source, importer) {
+            if (
+                !importer ||
+                typeof source !== 'string' ||
+                source.startsWith('\0') ||
+                !(source.startsWith('.') || source.startsWith('/'))
+            ) {
+                return null;
+            }
+            if (existsResolved(importer, source)) {
+                return null;
+            }
+            return { id: source, external: true };
+        },
         transform(code, id) {
             const normalized = id.replace(/\\/g, '/');
             if (!normalized.endsWith('/server.js')) {
