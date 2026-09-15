@@ -1,21 +1,8 @@
 /**
- * reservedNames для javascript-obfuscator.
- *
- * Подключение в obfuscateBundle.js и obfuscateModules.js:
- *
- *   const reservedNames = require('./reservedNames');
- *   const obfuscatorConfig = {
- *       identifierNamesGenerator: 'mangled-shuffled',
- *       reservedNames,
- *       // ...
- *   };
- *
- * Шаблоны — регулярки. `^Name$` = точное имя.
- * `^[A-Za-z_$][\\w$]*Service$` = любое имя, которое заканчивается на Service
- * (CubesService, GuideService, FormsService, …), чтобы не перечислять каждый модуль.
+ * reservedNames для javascript-obfuscator (коробка obfuscator/).
+ * Не сжимать имена, по которым CMS/хуки склеивают модули.
  */
 module.exports = [
-    // Node / бандл
     '^require$',
     '^process$',
     '^module$',
@@ -28,24 +15,16 @@ module.exports = [
     '^__filename$',
     '^__non_webpack_require__$',
     '^__EXT_MODULES__$',
-
-    // Свободные идентификаторы CMS между файлами (пер-модульная обфускация)
     '^sreda$',
     '^services$',
     '^wrapper$',
-
-    // Все *Service и *Class — иначе после обфускации останутся только зарезервированные
     '^[A-Za-z_$][\\w$]*Service$',
     '^[A-Za-z_$][\\w$]*Class$',
     '^[A-Za-z_$][\\w$]*Controller$',
-
-    // Ядро хуков и метаданных
     '^Extensions$',
     '^DefaultMetaObject$',
     '^MetadataService$',
     '^LevelClass$',
-
-    // Методы, по которым ищутся хуки и файлы
     '^getClassesMetadata$',
     '^getTreeChildrenV2$',
     '^getTreeChildrenV3$',
@@ -59,8 +38,6 @@ module.exports = [
     '^childrenClassName$',
     '^_hookClassName$',
     '^_sourceMethods$',
-
-    // Узлы дерева / id модулей (строки child.class)
     '^Roles$',
     '^Rules$',
     '^Rls$',
@@ -75,8 +52,6 @@ module.exports = [
     '^Infoservice$',
     '^InfoserviceGuide$',
     '^InfoserviceMatrixGuide$',
-
-    // Явные сервисы на случай, если общий шаблон *Service не сработает
     '^RolesService$',
     '^RulesService$',
     '^RlsService$',

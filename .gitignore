@@ -3,6 +3,8 @@ node_modules/
 .env.*
 dist/
 dist-temp/
+dist-obf/
+obfuscator/.src-cache/
 *.log
 .DS_Store
 Thumbs.db
